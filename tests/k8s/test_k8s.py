@@ -11,10 +11,10 @@ from jina import Flow
 
 
 def run_test(k8s_cluster, flow, logger, endpoint, port_expose):
-    start_flow(flow, logger)
-    resp = send_dummy_request(
-        endpoint, k8s_cluster, flow, logger, port_expose=port_expose
-    )
+    with flow:
+        resp = send_dummy_request(
+            endpoint, k8s_cluster, flow, logger, port_expose=port_expose
+        )
     return resp
 
 
@@ -32,21 +32,70 @@ def send_dummy_request(endpoint, k8s_cluster, k8s_flow_with_needs, logger, port_
     return resp
 
 
-def start_flow(flow, logger):
-    logger.debug(f'Starting flow on kind cluster...')
-    flow.start()
-    logger.debug(f'Done starting flow on kind cluster...')
+@pytest.fixture()
+def k8s_flow_with_init_container(
+    test_executor_image: str, executor_merger_image: str, dummy_dumper_image: str
+) -> Flow:
+    flow = Flow(
+        name='test-flow-with-init-container',
+        port_expose=9090,
+        infrastructure='K8S',
+        protocol='http',
+        timeout_ready=60000,
+    ).add(
+        name='test_executor',
+        uses=test_executor_image,
+        k8s_init_container_command=["python", "dump.py", "/shared/test_file.txt"],
+        k8s_uses_init=dummy_dumper_image,
+        k8s_mount_path='/shared',
+        timeout_ready=60000,
+    )
+    return flow
 
 
 @pytest.fixture()
-def k8s_flow_with_needs(test_executor_image: str, executor_merger_image: str) -> Flow:
+def k8s_flow_with_sharding(
+    test_executor_image: str, executor_merger_image: str, dummy_dumper_image: str
+) -> Flow:
+    flow = Flow(
+        name='test-flow-with-sharding',
+        port_expose=9090,
+        infrastructure='K8S',
+        protocol='http',
+        timeout_ready=60000,
+    ).add(
+        name='test_executor',
+        shards=3,
+        replicas=2,
+        uses=test_executor_image,
+        uses_after=executor_merger_image,
+        timeout_ready=60000,
+    )
+    return flow
+
+
+@pytest.mark.timeout(3600)
+@pytest.mark.parametrize('k8s_connection_pool', [True, False])
+def test_flow_with_needs(
+    k8s_cluster,
+    test_executor_image: str,
+    executor_merger_image: str,
+    load_images_in_kind,
+    set_test_pip_version,
+    logger,
+    k8s_connection_pool: bool,
+):
+    name = 'test-flow-with-needs'
+    if k8s_connection_pool:
+        name += '-pool'
     flow = (
         Flow(
-            name='test-flow',
+            name=name,
             port_expose=9090,
             infrastructure='K8S',
             protocol='http',
             timeout_ready=60000,
+            k8s_connection_pool=k8s_connection_pool,
         )
         .add(
             name='segmenter',
@@ -84,65 +133,9 @@ def k8s_flow_with_needs(test_executor_image: str, executor_merger_image: str) ->
             needs=['imagestorage', 'textstorage'],
         )
     )
-    return flow
-
-
-@pytest.fixture()
-def k8s_flow_with_init_container(
-    test_executor_image: str, executor_merger_image: str, dummy_dumper_image: str
-) -> Flow:
-    flow = Flow(
-        name='test-flow',
-        port_expose=8080,
-        infrastructure='K8S',
-        protocol='http',
-        timeout_ready=60000,
-    ).add(
-        name='test_executor',
-        uses=test_executor_image,
-        k8s_init_container_command=["python", "dump.py", "/shared/test_file.txt"],
-        k8s_uses_init=dummy_dumper_image,
-        k8s_mount_path='/shared',
-        timeout_ready=60000,
-    )
-    return flow
-
-
-@pytest.fixture()
-def k8s_flow_with_sharding(
-    test_executor_image: str, executor_merger_image: str, dummy_dumper_image: str
-) -> Flow:
-    flow = Flow(
-        name='test-flow',
-        port_expose=8080,
-        infrastructure='K8S',
-        protocol='http',
-        timeout_ready=60000,
-    ).add(
-        name='test_executor',
-        shards=3,
-        replicas=2,
-        uses=test_executor_image,
-        uses_after=executor_merger_image,
-        timeout_ready=60000,
-    )
-    return flow
-
-
-@pytest.mark.timeout(3600)
-@pytest.mark.parametrize('k8s_connection_pool', [True, False])
-def test_flow_with_needs(
-    k8s_cluster,
-    k8s_flow_with_needs: Flow,
-    load_images_in_kind,
-    set_test_pip_version,
-    logger,
-    k8s_connection_pool: bool,
-):
-    k8s_flow_with_needs.args.k8s_connection_pool = k8s_connection_pool
     resp = run_test(
         k8s_cluster,
-        k8s_flow_with_needs,
+        flow,
         logger,
         endpoint='index',
         port_expose=9090,
@@ -176,7 +169,7 @@ def test_flow_with_init(
         k8s_flow_with_init_container,
         logger,
         endpoint='search',
-        port_expose=8080,
+        port_expose=9090,
     )
 
     assert resp.status_code == HTTPStatus.OK
@@ -199,7 +192,7 @@ def test_flow_with_sharding(
         k8s_flow_with_sharding,
         logger,
         endpoint='index',
-        port_expose=8080,
+        port_expose=9090,
     )
 
     expected_traversed_executors = {
